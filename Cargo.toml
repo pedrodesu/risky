@@ -1,0 +1,15 @@
+[package]
+name = "risky"
+description = "a minimal RISC-V kernel written in Rust"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+spin = "0.10.0"
+talc = "4.4.3"
+
+# We have no tests/benchmarking yet
+[[bin]]
+name = "risky"
+test = false
+bench = false
