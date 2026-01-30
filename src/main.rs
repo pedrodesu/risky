@@ -11,15 +11,17 @@
 extern crate alloc;
 
 #[macro_use]
-mod macros;
+mod arch;
+
+#[macro_use]
+mod uart;
 
 mod heap;
 mod interrupt;
 mod plic;
-pub mod soc;
+mod soc;
 mod task;
 mod timer;
-mod uart;
 
 use core::{
     arch::{asm, naked_asm},
@@ -77,13 +79,13 @@ extern "C" fn _start()
 #[unsafe(no_mangle)]
 extern "C" fn kmain() -> !
 {
-    unsafe { uart::init() }
+    uart::init();
     println!("UART initialised");
 
-    unsafe { plic::init() }
+    plic::init();
     println!("PLIC initialised");
 
-    unsafe { heap::init() }
+    heap::init();
     println!("Allocator initialised");
 
     SCHEDULER.call_once(|| {
@@ -95,18 +97,18 @@ extern "C" fn kmain() -> !
 
     // Calculate the top of the trap stack (highest address)
     let trap_stack_ptr = ((core::ptr::addr_of!(TRAP_STACK) as usize) + TRAP_STACK_SIZE) & !0xF;
-    unsafe { interrupt::init(trap_stack_ptr) }
+    interrupt::init(trap_stack_ptr);
     println!("Interrupts vector set");
 
-    unsafe { timer::schedule_next() }
+    timer::schedule_next();
     println!("Timer started");
 
-    unsafe { interrupt::enable() }
+    interrupt::enable();
     println!("Interrupts enabled");
 
-    Task::spawn(task_a as *const ());
-    Task::spawn(task_b as *const ());
-    Task::spawn(task_c as *const ());
+    Task::spawn(task_a);
+    Task::spawn(task_b);
+    Task::spawn(task_c);
 
     loop
     {

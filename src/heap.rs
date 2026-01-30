@@ -33,7 +33,7 @@ unsafe impl<O: OomHandler> GlobalAlloc for AllocWrapper<O>
     }
 }
 
-pub unsafe fn init()
+pub fn init()
 {
     unsafe extern "C" {
         static _end: u8;

@@ -97,7 +97,7 @@ impl Scheduler
         // After this line, we are on a different stack
         // We're switching contexts which means switching stacks. This is why we
         // intentionally drop the mutex before
-        unsafe { switch_context(old_ctx_ptr, new_ctx_ptr) }
+        unsafe { switch_context(old_ctx_ptr, new_ctx_ptr) };
 
         let scheduler = scheduler.lock();
         scheduler.current_task.context.pc

@@ -19,13 +19,12 @@ SECTIONS {
 
     .bss : {
         *(.bss*)
-        *(COMMON)
     }
 
+    /* Keep these separate and ALIGN(4096) for MMU protection */
     .bss.stack (NOLOAD) : ALIGN(4096) {
         KEEP(*(.bss.stack))
     }
-
     .bss.trap_stack (NOLOAD) : ALIGN(4096) {
         KEEP(*(.bss.trap_stack))
     }

@@ -51,18 +51,30 @@ impl Task
     pub extern "C" fn trampoline()
     {
         naked_asm!(
-            "csrsi mstatus, 8",   // Enable interrupts
-            "la ra, {exit}",      // Set return address to Task::exit
-            "jr s1",              // Jump to entry point
-            exit = sym Task::exit,
+            "csrsi mstatus, 8",     // Enable interrupts
+            "mv a0, s1",            // `data` argument
+            "mv a1, s2",            // `vtable` argument
+            "la ra, {exit}",        // Set return address to Task::exit
+            "tail {shim}",          // Jump to the shim
+            exit = sym Self::exit,
+            shim = sym Self::task_entry_shim,
         )
     }
 
+    extern "C" fn task_entry_shim(data: usize, vtable: usize)
+    {
+        let closure =
+            unsafe { Box::from_raw(core::mem::transmute::<_, *mut dyn FnOnce()>((data, vtable))) };
+
+        closure();
+    }
+
     #[inline]
-    pub fn spawn(entry: *const ())
+    pub fn spawn(entry: impl FnOnce() + 'static)
     {
         let scheduler = SCHEDULER.get().unwrap();
-        scheduler.lock().add_task(Task::from(entry));
+        let boxed: Box<dyn FnOnce()> = Box::new(entry);
+        scheduler.lock().add_task(Task::from(boxed));
     }
 
     fn exit() -> !
@@ -85,9 +97,9 @@ impl Task
     }
 }
 
-impl From<*const ()> for Task
+impl From<Box<dyn FnOnce()>> for Task
 {
-    fn from(entry_point: *const ()) -> Self
+    fn from(entry_point: Box<dyn FnOnce()>) -> Self
     {
         let mut stack = Box::new([0; _]);
 
@@ -96,11 +108,18 @@ impl From<*const ()> for Task
         let stack_top_unaligned = stack_bottom + STACK_SIZE;
         let sp = stack_top_unaligned & !0xF; // Align down to 16 bytes
 
+        // Deconstruct `entry_point` so that we can pass it to `ctx` as two flat
+        // pointers
+        let entry_ptr = Box::into_raw(entry_point);
+        let (data_ptr, vtable_ptr) =
+            unsafe { core::mem::transmute::<_, (usize, usize)>(entry_ptr) };
+
         let ctx = Context {
             ra: Task::trampoline as *const () as usize,
             pc: Task::trampoline as *const () as usize,
             sp,
-            s1: entry_point as usize,
+            s1: data_ptr,
+            s2: vtable_ptr,
             ..Default::default()
         };
 
