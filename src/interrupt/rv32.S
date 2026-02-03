@@ -2,8 +2,13 @@
 .global _trap
 .align 4
 _trap:
-    # 18 registers * 4 bytes = 72 bytes
-    addi sp, sp, -72
+    # sp = trap stack (the ptr you passed to interrupt::init)
+    # mscratch = the stack we were using before the trap (kmain or task stack)
+    csrrw sp, mscratch, sp
+
+    # 19 registers * 4 bytes = 76 bytes
+    # 80 bytes is the minimum for 16-byte alignment
+    addi sp, sp, -80
 
     # Save General Purpose Registers
     sw ra,  0*4(sp)
@@ -28,14 +33,12 @@ _trap:
     sw   t0, 16*4(sp)
     csrr t0, mcause
     sw   t0, 17*4(sp)
+    csrr t0, mscratch
+    sw   t0, 18*4(sp)
 
     # Call Rust handler (pass sp as pointer to TrapFrame)
     mv   a0, sp
     call trap_handler
-
-    # Restore CSRs (mcause isn't usually restored as it's read-only/status)
-    lw   t0, 16*4(sp)
-    csrw mepc, t0
 
     # Restore General Purpose Registers
     lw ra,  0*4(sp)
@@ -55,5 +58,13 @@ _trap:
     lw t5, 14*4(sp)
     lw t6, 15*4(sp)
 
-    addi sp, sp, 72
+    # Restore CSRs (mcause isn't usually restored as it's read-only/status)
+    lw   t0, 16*4(sp)
+    csrw mepc, t0
+    lw   t0, 18*4(sp)
+    csrw mscratch, t0
+
+    # Clean up and swap back
+    addi sp, sp, 80
+    csrrw sp, mscratch, sp  # sp is back to original, mscratch is back to safe stack
     mret

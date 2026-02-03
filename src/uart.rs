@@ -9,7 +9,7 @@ use core::{
     fmt::{self, Write},
 };
 
-use crate::soc::uart::*;
+use crate::{soc::uart::*, spin::Mutex};
 
 /// Initialize the UART
 /// In many environments (like QEMU), the baud rate is pre-set,
@@ -67,12 +67,15 @@ impl fmt::Write for Uart
     }
 }
 
+static UART: Mutex<Uart> = Mutex::new(Uart);
+
 /// A global helper to use formatting without creating a new struct every time.
 #[doc(hidden)]
 #[inline]
 pub fn _print(args: fmt::Arguments)
 {
-    let _ = Uart.write_fmt(args);
+    let mut guard = UART.lock();
+    guard.write_fmt(args).unwrap();
 }
 
 #[macro_export]

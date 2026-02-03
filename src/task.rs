@@ -70,6 +70,16 @@ impl Task
     }
 
     #[inline]
+    pub fn main() -> Self
+    {
+        Self {
+            context: Box::new(Context::default()),
+            kind: TaskKind::Main,
+            state: TaskState::default(),
+        }
+    }
+
+    #[inline]
     pub fn spawn(entry: impl FnOnce() + 'static)
     {
         let scheduler = SCHEDULER.get().unwrap();
@@ -127,19 +137,6 @@ impl From<Box<dyn FnOnce()>> for Task
             context: Box::new(ctx),
             kind: TaskKind::User { stack },
             state: Default::default(),
-        }
-    }
-}
-
-impl From<()> for Task
-{
-    #[inline]
-    fn from(_: ()) -> Self
-    {
-        Self {
-            context: Box::new(Context::default()),
-            kind: TaskKind::Main,
-            state: TaskState::default(),
         }
     }
 }

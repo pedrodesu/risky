@@ -9,14 +9,13 @@
 //!   to the next available task. It handles context switching and task state
 //!   management.
 
-use alloc::collections::VecDeque;
+use alloc::{boxed::Box, collections::VecDeque};
 use core::mem;
 
-use spin::{Mutex, Once};
-
 use super::{Context, Task, TaskKind, TaskState, switch_context};
+use crate::spin::{LazyLock, OnceLock};
 
-pub static SCHEDULER: Once<Mutex<Scheduler>> = Once::new();
+pub static SCHEDULERS: OnceLock<Box<[Scheduler]>> = OnceLock::new();
 
 pub struct Scheduler
 {

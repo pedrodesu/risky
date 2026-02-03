@@ -12,7 +12,7 @@ use crate::{
     timer, uart,
 };
 
-const MIE_FLAG: usize = 1 << 3; // Machine Interrupt Enable for `mstatus`
+pub const MIE_FLAG: usize = 1 << 3; // Machine Interrupt Enable for `mstatus`
 
 #[cfg(target_pointer_width = "64")]
 global_asm!(include_str!("interrupt/rv64.S"));
@@ -45,6 +45,7 @@ struct TrapFrame
     // CSRs
     mepc: usize,
     mcause: usize,
+    mscratch: usize,
 }
 
 // Low-level trap entry point.
@@ -142,7 +143,7 @@ fn handle_exception(code: usize, epc: usize) -> usize
     }
 }
 
-/// Consequently enable all the set interrupts with `init`
+/// Enable all the set interrupts with `init`
 #[inline]
 pub fn enable()
 {
@@ -150,8 +151,16 @@ pub fn enable()
     unsafe { csr_set_i!("mstatus", MIE_FLAG) }
 }
 
+/// Disable all interrupts
+#[inline]
+pub fn disable()
+{
+    // mstatus.MIE: Global interrupt enable for Machine Mode
+    unsafe { csr_clear_i!("mstatus", MIE_FLAG) }
+}
+
 /// Initialize Machine-Mode Interrupts
-pub fn init(kernel_sp: usize)
+pub fn init(trap_stack_ptr: usize)
 {
     // mtvec setup: Direct mode
     // All traps will jump to the exact address of _trap
@@ -164,7 +173,7 @@ pub fn init(kernel_sp: usize)
     }
 
     // Before enabling interrupts, mscratch MUST hold the kernel stack pointer
-    unsafe { csr_write!("mscratch", kernel_sp) }
+    unsafe { csr_write!("mscratch", trap_stack_ptr) }
 
     // mie: Enable specific interrupt sources
     unsafe {
