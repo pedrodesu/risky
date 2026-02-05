@@ -5,9 +5,8 @@
 
 use core::alloc::{GlobalAlloc, Layout};
 
+use spin::Mutex;
 use talc::{ErrOnOom, OomHandler, Span, Talc};
-
-use crate::spin::Mutex;
 
 const HEAP_SIZE: usize = 4 * 1024 * 1024; // 4MB
 

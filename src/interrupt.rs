@@ -6,18 +6,19 @@
 use core::arch::{asm, global_asm};
 
 use crate::{
-    arch::cause::{self, exceptions, interrupts},
-    plic, soc,
-    task::Scheduler,
-    timer, uart,
+    arch::{
+        Cpu,
+        cause::{self, exceptions, interrupts},
+    },
+    timer,
 };
 
-pub const MIE_FLAG: usize = 1 << 3; // Machine Interrupt Enable for `mstatus`
+pub const SIE_FLAG: usize = 1 << 1; // Supervisor Interrupt Enable for `sstatus`
 
-#[cfg(target_pointer_width = "64")]
+#[cfg(target_arch = "riscv64")]
 global_asm!(include_str!("interrupt/rv64.S"));
 
-#[cfg(target_pointer_width = "32")]
+#[cfg(target_arch = "riscv32")]
 global_asm!(include_str!("interrupt/rv32.S"));
 
 /// Defines the layout of the registers saved on the stack during a trap.
@@ -43,9 +44,9 @@ struct TrapFrame
     t5: usize,
     t6: usize,
     // CSRs
-    mepc: usize,
-    mcause: usize,
-    mscratch: usize,
+    sepc: usize,
+    scause: usize,
+    sscratch: usize,
 }
 
 // Low-level trap entry point.
@@ -61,11 +62,11 @@ extern "C" fn trap_handler(frame: &mut TrapFrame)
     // Check top bit. If it's 1, we have an interrupt. Otherwise, it's an exception.
     const CAUSE_INTERRUPT_FLAG: usize = 1 << (core::mem::size_of::<usize>() * 8 - 1);
 
-    let &mut TrapFrame { mcause, mepc, .. } = frame;
+    let &mut TrapFrame { scause, sepc, .. } = frame;
 
-    let is_interrupt = mcause & CAUSE_INTERRUPT_FLAG != 0;
+    let is_interrupt = scause & CAUSE_INTERRUPT_FLAG != 0;
     // Mask out the interrupt bit to get the Exception Code
-    let code = mcause & !CAUSE_INTERRUPT_FLAG;
+    let code = scause & !CAUSE_INTERRUPT_FLAG;
 
     let new_epc = if is_interrupt
     {
@@ -73,52 +74,33 @@ extern "C" fn trap_handler(frame: &mut TrapFrame)
 
         match code
         {
-            MACHINE_TIMER_INTERRUPT => handle_timer_interrupt(mepc),
-            MACHINE_EXTERNAL_INTERRUPT =>
-            {
-                handle_external_interrupt();
-                mepc
-            }
-            _ => mepc,
+            SUPERVISOR_SOFTWARE_INTERRUPT => handle_software_interrupt(sepc),
+            SUPERVISOR_TIMER_INTERRUPT => handle_timer_interrupt(sepc),
+            _ => sepc,
         }
     }
     else
     {
-        handle_exception(code, mepc)
+        handle_exception(code, sepc)
     };
 
-    frame.mepc = new_epc;
+    frame.sepc = new_epc;
+}
+
+fn handle_software_interrupt(epc: usize) -> usize
+{
+    timer::ipi::clear();
+
+    let mut scheduler = Cpu::get().scheduler.lock();
+    scheduler.schedule(epc)
 }
 
 fn handle_timer_interrupt(epc: usize) -> usize
 {
     timer::schedule_next();
-    Scheduler::schedule(epc)
-}
 
-fn handle_external_interrupt()
-{
-    let irq = plic::claim();
-
-    match irq
-    {
-        soc::uart::IRQ =>
-        {
-            if let Some(c) = uart::get_char()
-            {
-                // Echo back
-                print!("{}", c as char);
-            }
-        }
-        0 =>
-        {}
-        _ => panic!("Unhandled external IRQ: {}", irq),
-    }
-
-    if irq != 0
-    {
-        plic::complete(irq);
-    }
+    let mut scheduler = Cpu::get().scheduler.lock();
+    scheduler.schedule(epc)
 }
 
 fn handle_exception(code: usize, epc: usize) -> usize
@@ -129,8 +111,16 @@ fn handle_exception(code: usize, epc: usize) -> usize
     {
         USER_ECALL | SUPERVISOR_ECALL | MACHINE_ECALL =>
         {
-            // Return next instruction address
-            epc + 4
+            let mut scheduler = Cpu::get().scheduler.lock();
+
+            // We move the EPC forward by 4 so that IF this task is ever
+            // rescheduled (not applicable for Dead tasks, but vital for Syscalls),
+            // it resumes AFTER the ecall instruction.
+            let next_pc = epc + 4;
+
+            // If the task is Dead, schedule() returns the PC of a NEW task.
+            // If the task is alive (e.g. a yield), it returns next_pc.
+            scheduler.schedule(next_pc)
         }
         INSTRUCTION_ACCESS_FAULT => panic!(
             "Instruction Access Fault at {:#x}! (Likely task returned or bad RA)",
@@ -148,7 +138,7 @@ fn handle_exception(code: usize, epc: usize) -> usize
 pub fn enable()
 {
     // mstatus.MIE: Global interrupt enable for Machine Mode
-    unsafe { csr_set_i!("mstatus", MIE_FLAG) }
+    unsafe { csr_set_i!("sstatus", SIE_FLAG) }
 }
 
 /// Disable all interrupts
@@ -156,32 +146,31 @@ pub fn enable()
 pub fn disable()
 {
     // mstatus.MIE: Global interrupt enable for Machine Mode
-    unsafe { csr_clear_i!("mstatus", MIE_FLAG) }
+    unsafe { csr_clear_i!("sstatus", SIE_FLAG) }
 }
 
 /// Initialize Machine-Mode Interrupts
 pub fn init(trap_stack_ptr: usize)
 {
-    // mtvec setup: Direct mode
+    // stvec setup: Direct mode
     // All traps will jump to the exact address of _trap
     unsafe {
         asm!(
             "la t0, {trap}",
-            "csrw mtvec, t0",
+            "csrw stvec, t0",
             trap = sym _trap
         )
     }
 
-    // Before enabling interrupts, mscratch MUST hold the kernel stack pointer
-    unsafe { csr_write!("mscratch", trap_stack_ptr) }
+    // Before enabling interrupts, sscratch must hold the kernel stack pointer
+    unsafe { csr_write!("sscratch", trap_stack_ptr) }
 
-    // mie: Enable specific interrupt sources
+    // sie: Enable specific interrupt sources
     unsafe {
         csr_set!(
-            "mie",
-            1 << cause::interrupts::MACHINE_EXTERNAL_INTERRUPT
-                | 1 << cause::interrupts::MACHINE_TIMER_INTERRUPT
-                | 1 << cause::interrupts::MACHINE_SOFTWARE_INTERRUPT
+            "sie",
+            1 << cause::interrupts::SUPERVISOR_TIMER_INTERRUPT
+                | 1 << cause::interrupts::SUPERVISOR_SOFTWARE_INTERRUPT
         )
     }
 }

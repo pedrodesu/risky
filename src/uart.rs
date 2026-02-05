@@ -4,55 +4,28 @@
 //! `fmt::Write` trait, allowing it to be used by the `print!` and `println!`
 //! macros.
 
-use core::{
-    arch::asm,
-    fmt::{self, Write},
-};
+use core::fmt::{self, Write};
 
-use crate::{soc::uart::*, spin::Mutex};
+use spin::Mutex;
 
-/// Initialize the UART
-/// In many environments (like QEMU), the baud rate is pre-set,
-/// but we must ensure interrupts are configured correctly
-pub fn init()
-{
-    // Disable interrupts during setup
-    IER.write(0x00);
-
-    // Enable and Reset FIFOs (Bit 0: Enable, Bit 1: Clear RX, Bit 2: Clear TX)
-    FCR.write(0b0000_0111);
-
-    // Enable RX interrupts
-    IER.write(0x01)
-}
+use crate::sbi;
 
 #[inline]
 pub fn get_char() -> Option<u8>
 {
-    if (lsr::ADDR.read() & lsr::RX_READY) != 0
+    match sbi::console_getchar()
     {
-        Some(RBR.read())
-    }
-    else
-    {
-        None
+        // -1 means no character is available.
+        -1 => None,
+        // Otherwise, we have a valid character.
+        c => Some(c as u8),
     }
 }
 
-/// Safety: We loop until LSR is idle
+#[inline]
 pub fn putc(c: u8)
 {
-    // We must wait for the UART to be ready to accept a new byte, else we might
-    // overwrite a character that hasn't been sent yet (FIFO overflow).
-    while (lsr::ADDR.read() & lsr::TX_IDLE) == 0
-    {
-        core::hint::spin_loop();
-    }
-
-    // Wait for the other output writes
-    unsafe { asm!("fence ow, ow") }
-
-    THR.write(c)
+    sbi::console_putchar(c as usize);
 }
 
 pub struct Uart;

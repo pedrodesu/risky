@@ -2,26 +2,27 @@ OUTPUT_ARCH(riscv)
 ENTRY(_start)
 
 SECTIONS {
-    . = 0x80000000; /* QEMU virt RAM starts at 0x80000000 */
+    . = 0x80200000; /* OpenSBI usually expects the kernel at 0x80200000 */
 
-    .text : {
+    .text : ALIGN(4096) {
         KEEP(*(.text.entry))
         *(.text*)
     }
 
-    .rodata : {
+    .rodata : ALIGN(4096) {
         *(.rodata*)
     }
 
-    .data : {
+    .data : ALIGN(4096) {
         *(.data*)
     }
+
+    . = ALIGN(4096);
+    _bss_start = .;
 
     .bss : {
         *(.bss*)
     }
-
-    /* Keep these separate and ALIGN(4096) for MMU protection */
     .bss.stack (NOLOAD) : ALIGN(4096) {
         KEEP(*(.bss.stack))
     }
@@ -29,7 +30,8 @@ SECTIONS {
         KEEP(*(.bss.trap_stack))
     }
 
-    /* Mark the absolute end of all kernel-reserved memory */
-    . = ALIGN(16);
+    . = ALIGN(8);
+    _bss_end = .;
+
     _end = .;
 }

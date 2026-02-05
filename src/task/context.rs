@@ -29,10 +29,10 @@ pub struct Context
     pub pc: usize,
 }
 
-#[cfg(target_pointer_width = "64")]
+#[cfg(target_arch = "riscv64")]
 global_asm!(include_str!("context/rv64.S"));
 
-#[cfg(target_pointer_width = "32")]
+#[cfg(target_arch = "riscv32")]
 global_asm!(include_str!("context/rv32.S"));
 
 unsafe extern "C" {

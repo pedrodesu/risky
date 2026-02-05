@@ -11,12 +11,22 @@ mod context;
 mod scheduler;
 
 use alloc::boxed::Box;
-use core::arch::{asm, naked_asm};
+use core::{
+    arch::{asm, naked_asm},
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use context::*;
 pub use scheduler::*;
 
+use crate::{
+    arch::{CPU_VEC, Cpu},
+    timer,
+};
+
 const STACK_SIZE: usize = 1024 * 16; // 16KB
+
+static SPAWN_TICKET: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(PartialEq, Default)]
 pub enum TaskState
@@ -51,7 +61,7 @@ impl Task
     pub extern "C" fn trampoline()
     {
         naked_asm!(
-            "csrsi mstatus, 8",     // Enable interrupts
+            "csrsi sstatus, 2",     // Enable interrupts
             "mv a0, s1",            // `data` argument
             "mv a1, s2",            // `vtable` argument
             "la ra, {exit}",        // Set return address to Task::exit
@@ -79,18 +89,37 @@ impl Task
         }
     }
 
-    #[inline]
     pub fn spawn(entry: impl FnOnce() + 'static)
     {
-        let scheduler = SCHEDULER.get().unwrap();
+        let cpus = CPU_VEC.wait();
+        let n_harts = cpus.len();
+
+        let ticket = SPAWN_TICKET.fetch_add(1, Ordering::Relaxed);
+        let target_hart = ticket % n_harts;
+
         let boxed: Box<dyn FnOnce()> = Box::new(entry);
-        scheduler.lock().add_task(Task::from(boxed));
+
+        {
+            let mut scheduler = cpus[target_hart].scheduler.lock();
+            scheduler.add_task(Task::from(boxed));
+
+            // Drop the lock before sending the IPI to avoid a race where
+            // the target wakes up and tries to lock the scheduler while we
+            // still hold it.
+        }
+
+        let cpu = Cpu::get();
+        // Wake the target only if it's not us
+        if target_hart != cpu.logical_id
+        {
+            timer::ipi::send(cpus[target_hart].physical_id);
+        }
     }
 
     fn exit() -> !
     {
         {
-            let mut scheduler = SCHEDULER.get().unwrap().lock();
+            let mut scheduler = Cpu::get().scheduler.lock();
 
             let task = scheduler.task_mut();
             task.state = TaskState::Dead;
@@ -98,7 +127,7 @@ impl Task
         }
 
         // Trigger a trap to refresh the state immediately
-        unsafe { asm!("ecall") }
+        unsafe { csr_set_i!("sip", 2) } // Raise a supervisor software interrupt
 
         loop
         {

@@ -21,6 +21,5 @@ command = "${QEMU}"
 args = [
     "-machine", "virt",
     "-nographic",
-    "-bios", "none",
     "-kernel", "target/${TARGET}/debug/risky"
 ]

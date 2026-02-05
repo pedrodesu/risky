@@ -1,10 +1,16 @@
+use alloc::boxed::Box;
+use core::arch::asm;
+
+use spin::{Mutex, Once};
+
+use crate::task::Scheduler;
+
 pub mod cause
 {
     pub mod interrupts
     {
-        pub const MACHINE_SOFTWARE_INTERRUPT: usize = 3; // Software interrupt (Multicore communication (Scheduler))
-        pub const MACHINE_TIMER_INTERRUPT: usize = 7; // Timer (CLINT in our case)
-        pub const MACHINE_EXTERNAL_INTERRUPT: usize = 11; // External communication (UART)
+        pub const SUPERVISOR_SOFTWARE_INTERRUPT: usize = 1;
+        pub const SUPERVISOR_TIMER_INTERRUPT: usize = 5;
     }
 
     pub mod exceptions
@@ -20,62 +26,34 @@ pub mod cause
     }
 }
 
-/// Atomically clear bits in a CSR (no register). More efficient for smaller
-/// operands.
-#[macro_export]
-macro_rules! csr_clear_i {
-    ($csr:expr, $mask:expr) => {
-        core::arch::asm!(concat!("csrci ", $csr, ", {0}"), const $mask)
-    };
-}
+pub static CPU_VEC: Once<Box<[Cpu]>> = Once::new();
 
-/// Atomically clear bits in a CSR
-#[macro_export]
-macro_rules! csr_clear {
-    ($csr:expr, $mask:expr) => (core::arch::asm!(concat!("csrrc x0, ", $csr, ", {0}"), in(reg) $mask));
-}
-
-/// Atomically set bits in a CSR (no register). More efficient for smaller
-/// operands.
-#[macro_export]
-macro_rules! csr_set_i {
-    ($csr:expr, $mask:expr) => {
-        core::arch::asm!(concat!("csrsi ", $csr, ", {0}"), const $mask)
-    };
-}
-
-/// Atomically set bits in a CSR
-#[macro_export]
-macro_rules! csr_set {
-    ($csr:expr, $mask:expr) => (core::arch::asm!(concat!("csrrs x0, ", $csr, ", {0}"), in(reg) $mask));
-}
-
-/// Read a CSR into a usize
-#[macro_export]
-macro_rules! csr_read {
-    ($csr:expr) => {{
-        let r: usize;
-        core::arch::asm!(concat!("csrr {0}, ", $csr), out(reg) r);
-        r
-    }};
-}
-
-/// Write an immediate value (0-31) to a CSR
-#[macro_export]
-macro_rules! csr_write_i {
-    ($csr:expr, $val:expr) => (core::arch::asm!(concat!("csrwi ", $csr, ", {0}"), const $val));
-}
-
-/// Write a value to a CSR
-#[macro_export]
-macro_rules! csr_write {
-    ($csr:expr, $val:expr) => (core::arch::asm!(concat!("csrw ", $csr, ", {0}"), in(reg) $val));
-}
-
-#[inline]
-pub fn hart_id() -> usize
+#[repr(C)]
+pub struct Cpu
 {
-    let id: usize;
-    unsafe { core::arch::asm!("mv {0}, tp", out(reg) id) }
-    id
+    pub physical_id: usize,
+    pub logical_id: usize,
+    pub scheduler: Mutex<Scheduler>,
+    pub stack_top: usize,
+    pub trap_stack_top: usize,
+}
+
+impl Cpu
+{
+    #[inline]
+    pub fn set(&self)
+    {
+        let ptr = self as *const Cpu as usize;
+        unsafe { asm!("mv tp, {0}", in(reg) ptr) }
+    }
+
+    #[inline]
+    pub fn get() -> &'static Cpu
+    {
+        let ptr: usize;
+        unsafe {
+            asm!("mv {0}, tp", out(reg) ptr);
+            &*(ptr as *const Cpu)
+        }
+    }
 }

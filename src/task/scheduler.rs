@@ -9,13 +9,10 @@
 //!   to the next available task. It handles context switching and task state
 //!   management.
 
-use alloc::{boxed::Box, collections::VecDeque};
+use alloc::collections::VecDeque;
 use core::mem;
 
 use super::{Context, Task, TaskKind, TaskState, switch_context};
-use crate::spin::{LazyLock, OnceLock};
-
-pub static SCHEDULERS: OnceLock<Box<[Scheduler]>> = OnceLock::new();
 
 pub struct Scheduler
 {
@@ -48,57 +45,53 @@ impl Scheduler
         self.waiting_tasks.push_back(task);
     }
 
-    pub fn schedule(interrupted_epc: usize) -> usize
+    pub fn schedule(&mut self, interrupted_epc: usize) -> usize
     {
-        let scheduler = SCHEDULER.get().unwrap();
+        println!("[TRACE] In scheduler::schedule");
 
-        let (old_ctx_ptr, new_ctx_ptr) = {
-            let mut scheduler = scheduler.lock();
-
-            // We SHOULD always have at least the main task
-            let next_task = match scheduler.waiting_tasks.pop_front()
+        // We SHOULD always have at least the main task
+        let next_task = match self.waiting_tasks.pop_front()
+        {
+            Some(task) => task,
+            // No other tasks are ready, so just keep the current one.
+            None =>
             {
-                Some(task) => task,
-                // No other tasks are ready, so just keep the current one.
-                None =>
-                {
-                    // Before returning, we need to unlock the scheduler and
-                    // return the interrupted program counter.
-                    // This will resume the current task until the next interrupt.
-                    return interrupted_epc;
-                }
-            };
-            let mut old_task = mem::replace(&mut scheduler.current_task, next_task);
+                // Before returning, we need to unlock the scheduler and
+                // return the interrupted program counter.
+                // This will resume the current task until the next interrupt.
+                return interrupted_epc;
+            }
+        };
+        let mut old_task = mem::replace(&mut self.current_task, next_task);
 
-            let old_ctx_ptr = if
-            // The task still isn't over
-            old_task.state != TaskState::Dead ||
+        let old_ctx_ptr = if
+        // The task still isn't over
+        old_task.state != TaskState::Dead ||
             // The main task can never end
             old_task.kind == TaskKind::Main
-            {
-                old_task.context.pc = interrupted_epc;
+        {
+            old_task.context.pc = interrupted_epc;
 
-                let old_ctx = old_task.context.as_mut() as *mut Context;
-                scheduler.add_task(old_task);
-                old_ctx
-            }
-            else
-            {
-                &mut scheduler.idle_context
-            };
-
-            scheduler.current_task.state = TaskState::Running;
-            let new_ctx_ptr = scheduler.current_task.context.as_ref() as *const Context;
-
-            (old_ctx_ptr, new_ctx_ptr)
+            let old_ctx = old_task.context.as_mut() as *mut Context;
+            self.add_task(old_task);
+            old_ctx
+        }
+        else
+        {
+            let old_ctx = &mut self.idle_context;
+            drop(old_task);
+            old_ctx
         };
+
+        self.current_task.state = TaskState::Running;
+        let new_ctx_ptr = self.current_task.context.as_ref() as *const Context;
+        let new_pc = self.current_task.context.pc;
 
         // After this line, we are on a different stack
         // We're switching contexts which means switching stacks. This is why we
         // intentionally drop the mutex before
         unsafe { switch_context(old_ctx_ptr, new_ctx_ptr) };
 
-        let scheduler = scheduler.lock();
-        scheduler.current_task.context.pc
+        new_pc
     }
 }

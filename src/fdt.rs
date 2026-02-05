@@ -1,30 +1,36 @@
 use alloc::{boxed::Box, vec::Vec};
 
 use fdt_rs::{base::*, error::DevTreeError, prelude::*};
+use spin::Once;
 
-use crate::spin::OnceLock;
-
-static HART_ID_MAP: OnceLock<Box<[u32]>> = OnceLock::new();
+static HART_ID_MAP: Once<Box<[usize]>> = Once::new();
 
 #[inline]
-pub fn physical_to_logical(mhartid: usize) -> usize
+pub fn to_logical(physical_hart_id: usize) -> usize
 {
-    let map = HART_ID_MAP.wait();
-
-    map.iter()
-        .position(|&phys| phys == mhartid as _)
+    HART_ID_MAP
+        .wait()
+        .iter()
+        .copied()
+        .position(|p| p == physical_hart_id)
         .expect("Booting on an unregistered Hart!")
+}
+
+#[inline]
+pub fn to_physical(logical_hart_id: usize) -> usize
+{
+    HART_ID_MAP.wait()[logical_hart_id]
 }
 
 pub fn parse_hart_count(fdt_ptr: *const u8) -> Result<usize, DevTreeError>
 {
     let fdt = unsafe { DevTree::from_raw_pointer(fdt_ptr) }?;
-    let mut phys_ids = Vec::new();
+    let mut physical_ids = Vec::new();
 
     let mut nodes = fdt.nodes().skip_while(|n| Ok(n.name()? != "cpus"));
     while let Some(node) = nodes.next()?
     {
-        let (is_cpu, reg_id) = node.props().fold((false, None), |(cpu, reg), p| {
+        let (is_cpu, reg) = node.props().fold((false, None), |(cpu, reg), p| {
             Ok(match p.name()?
             {
                 "device_type" if p.str()? == "cpu" => (true, reg),
@@ -36,21 +42,30 @@ pub fn parse_hart_count(fdt_ptr: *const u8) -> Result<usize, DevTreeError>
 
         if is_cpu
         {
-            if let Some(phys_id) = reg_id
+            if let Some(reg) = reg
             {
-                phys_ids.push(phys_id);
+                physical_ids.push(reg as _);
             }
         }
         // We've seen CPUs and now we've hit something else. Stop here.
-        else if !phys_ids.is_empty()
+        else if !physical_ids.is_empty()
         {
             break;
         }
     }
 
-    let count = phys_ids.len();
+    if physical_ids.is_empty()
+    {
+        // We didn't find any CPUs in the device tree,
+        // but we know at least one exists because we are running on it.
 
-    HART_ID_MAP.set(phys_ids.into_boxed_slice()).unwrap();
+        // Assume Hart 0 as a sane default if FDT is broken.
+        physical_ids.push(0);
+    }
 
-    Ok(if count == 0 { 1 } else { count })
+    let count = physical_ids.len();
+
+    HART_ID_MAP.call_once(|| physical_ids.into_boxed_slice());
+
+    Ok(count)
 }

@@ -11,33 +11,34 @@
 extern crate alloc;
 
 #[macro_use]
-mod arch;
+mod csr;
 
 #[macro_use]
 mod uart;
 
+mod arch;
 mod fdt;
 mod heap;
 mod interrupt;
 mod plic;
+mod sbi;
 mod soc;
-mod spin;
 mod task;
 mod timer;
 
-use alloc::vec::Vec;
+use alloc::alloc::alloc;
 use core::{
+    alloc::Layout,
     arch::{asm, naked_asm},
     panic::PanicInfo,
-    sync::atomic::{AtomicBool, Ordering},
 };
 
-use crate::{
-    spin::Mutex,
-    task::{SCHEDULERS, Scheduler, Task},
-};
+use spin::Mutex;
+use task::{Scheduler, Task};
 
-// Ensure the 16-bit alignment of the stacks as per requested by RISC-V ABI
+use crate::arch::{CPU_VEC, Cpu};
+
+// Ensure the page alignment of the stacks
 #[repr(align(4096))]
 pub struct Aligned<const N: usize>([u8; N]);
 
@@ -47,8 +48,10 @@ const TRAP_STACK_SIZE: usize = 1024 * 8; // 8KB
 #[unsafe(link_section = ".bss.stack")]
 static mut BOOT_STACK: Aligned<STACK_SIZE> = Aligned([0; _]);
 
-#[unsafe(link_section = ".bss.trap_stack")]
-static mut TRAP_STACK: Aligned<TRAP_STACK_SIZE> = Aligned([0; _]);
+unsafe extern "C" {
+    static _bss_start: u8;
+    static _bss_end: u8;
+}
 
 #[unsafe(link_section = ".text.entry")]
 #[unsafe(naked)]
@@ -56,72 +59,160 @@ static mut TRAP_STACK: Aligned<TRAP_STACK_SIZE> = Aligned([0; _]);
 extern "C" fn _start()
 {
     naked_asm!(
-        // a0 = hartid, a1 = fdt_ptr (passed by the hardware/loader)
-        // Save the FDT pointer into a temporary register that survives stack setup
-        "mv s1, a1",
+        // a0 = physical hartid, a1 = FDT pointer (if hart 0) OR heap_stack_top (if hart > 0)
 
-        // Calculate this Hart's stack pointer
-        // Each hart gets its own slice of BOOT_STACK
+        // Branching: Master vs Secondary
+        "bnez a0, 5f",
+
+        // -- Master Hart Setup
         "la t0, {boot_stack}",
         "li t1, {stack_size}",
-        "mv t2, a0",            // Get physical hart_id from a0
-        "addi t2, t2, 1",       // hart_id + 1
-        "mul t1, t1, t2",       // (hart_id + 1) * stack_size
-        "add sp, t0, t1",       // sp = boot_stack + offset
+        "add sp, t0, t1",       // sp = BOOT_STACK + STACK_SIZE
 
-        // Enforce 16-byte alignment (RISC-V ABI)
-        "andi sp, sp, -16",
+        // Clear BSS (Only on Hart 0)
+        "la t0, {bss_start}",
+        "la t1, {bss_end}",
+        "4:",
+        "bge t0, t1, 6f",       // Finished zeroing?
+        "sd zero, 0(t0)",       // Wipe 8 bytes
+        "addi t0, t0, 8",
+        "j 4b",                 // Loop
 
-        "mv a1, s1",            // Restore FDT pointer to second argument
-        // a0 is already the hart_id, so we don't need to move it
+        "6:",
+        "fence iorw, iorw",    // Ensure BSS zeroing is globally visible
+        // a1 still contains FDT pointer, sp points to BOOT_STACK
+        "j 3f",
 
-        // All harts jump to kmain
-        "j kmain",
+        // -- Secondary Hart Setup
+        "5:",
+        // a1 contains the `opaque` value (`cpu.stack_top`) from sbi::hart_start
+        "mv sp, a1",
+        "li a1, 0",             // Clear a1 so kmain knows this isn't an FDT
 
-        boot_stack = sym BOOT_STACK,
-        stack_size = const STACK_SIZE,
+        // -- Final Common Setup
+        "3:",
+        "andi sp, sp, -16",     // Ensure 16-byte alignment for ABI
+        "call kmain",
+        "j 2f",                 // If kmain returns (it shouldn't), park the hart safely
+
+        // -- Parking Lot
+        "2:",
+        "wfi",
+        "j 2b",
+
+        boot_stack  = sym BOOT_STACK,
+        stack_size  = const STACK_SIZE,
+        bss_start   = sym _bss_start,
+        bss_end     = sym _bss_end,
     );
 }
 
-#[unsafe(no_mangle)]
-extern "C" fn kmain(hart_id: usize, fdt_ptr: *const u8) -> !
+fn init_cpu_vec(fdt_ptr: *const u8)
 {
+    let count = fdt::parse_hart_count(fdt_ptr).unwrap();
+    let cpus = (0..count)
+        .map(|i| {
+            let layout = Layout::from_size_align(STACK_SIZE, 4096).unwrap(); // Ensure page alignment
+            let stack_ptr = unsafe { alloc(layout) as usize };
+
+            let t_layout = Layout::from_size_align(TRAP_STACK_SIZE, 4096).unwrap();
+            let trap_ptr = unsafe { alloc(t_layout) as usize };
+
+            Cpu {
+                physical_id: fdt::to_physical(i),
+                logical_id: i,
+                scheduler: Mutex::new(Scheduler::with_task(Task::main())),
+                stack_top: stack_ptr + STACK_SIZE,
+                trap_stack_top: trap_ptr + STACK_SIZE,
+            }
+        })
+        .collect();
+
+    CPU_VEC.call_once(|| cpus);
+}
+
+fn start_harts()
+{
+    let cpus = &CPU_VEC.wait();
+    // Safety: We know we have at least one CPU (CPU zero)
+    let (cpu_zero, rem_cpus) = unsafe { cpus.split_first().unwrap_unchecked() };
+
+    cpu_zero.set();
+
+    // Hart 0 is already started.
+    for cpu in rem_cpus
+    {
+        // We pass `stack_to_use` as the `opaque` value. This arrives in `a1` on the
+        // other side.
+        if !sbi::hart_start(cpu.physical_id, _start as *const () as usize, cpu.stack_top)
+        {
+            println!("[ERROR] Failed to start Hart {}", cpu.physical_id);
+        }
+    }
+
+    unsafe {
+        asm!(
+            "mv sp, {0}",
+            "jr {1}",
+            in(reg) cpu_zero.stack_top,
+            in(reg) hart_setup as *const () as usize,
+        )
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn kmain(hart_id: usize, opaque: usize) -> !
+{
+    // If we are Hart 0, `opaque` is the FDT pointer.
+    // If we are Hart 1+, `opaque` is 0 (unused) (set at `_start`)
+
     if hart_id == 0
     {
-        uart::init();
+        let fdt_ptr = opaque as *const u8;
+        println!("[TRACE] Hart 0 kmain entry. FDT pointer: {:p}", fdt_ptr);
+
         heap::init();
+        println!("[TRACE] Heap initialized.");
 
-        let count = fdt::parse_hart_count(fdt_ptr).unwrap();
-        let mut v = Vec::with_capacity(count);
-        for _ in 0..count
-        {
-            v.push(Scheduler::with_task(Task::main()));
-        }
+        init_cpu_vec(fdt_ptr);
 
-        SCHEDULERS.set(v.into_boxed_slice()).ok();
+        start_harts();
+        // We jump to another function in `start_harts`
+        unreachable!();
     }
     else
     {
-        SCHEDULERS.wait();
+        let cpu = CPU_VEC.wait().get(fdt::to_logical(hart_id)).unwrap();
+        cpu.set();
+
+        hart_setup();
     }
+}
 
-    // Move hart_id to tp register. Probably want to put this in its own place
-    let logical_id = fdt::physical_to_logical(hart_id);
-    unsafe { asm!("mv tp, {}", in(reg) logical_id) };
+fn hart_setup() -> !
+{
+    let cpu = Cpu::get();
 
-    plic::init();
+    println!(
+        "[TRACE] Hart {} (Physical {}) is online.",
+        cpu.logical_id, cpu.physical_id
+    );
 
-    // Calculate the top of the trap stack (highest address)
-    let trap_stack_ptr = ((core::ptr::addr_of!(TRAP_STACK) as usize) + TRAP_STACK_SIZE) & !0xF;
-    interrupt::init(trap_stack_ptr);
+    println!("[TRACE] Hart {}: Initializing interrupts..", cpu.logical_id);
+    interrupt::init(cpu.trap_stack_top);
 
+    plic::init(cpu.physical_id);
+
+    println!(
+        "[TRACE] Hart {}: Scheduling next timer interrupt..",
+        cpu.logical_id
+    );
     timer::schedule_next();
 
+    println!("[TRACE] Hart {}: Enabling interrupts..", cpu.logical_id);
     interrupt::enable();
 
-    println!("Hart {} is ready.", hart_id);
-
-    if hart_id == 0
+    if cpu.logical_id == 0
     {
         Task::spawn(task_a);
         Task::spawn(task_b);
@@ -130,7 +221,7 @@ extern "C" fn kmain(hart_id: usize, fdt_ptr: *const u8) -> !
 
     loop
     {
-        unsafe { asm!("wfi") }
+        sbi::hart_suspend();
     }
 }
 
