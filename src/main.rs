@@ -30,7 +30,9 @@ use alloc::alloc::alloc;
 use core::{
     alloc::Layout,
     arch::{asm, naked_asm},
+    hint,
     panic::PanicInfo,
+    sync::atomic::{AtomicU8, Ordering},
 };
 
 use spin::Mutex;
@@ -53,6 +55,17 @@ unsafe extern "C" {
     static _bss_end: u8;
 }
 
+#[repr(u8)]
+enum BootStage
+{
+    ColdBoot = 0,
+    BssInitialized = 1,
+    ReadyToWork = 2,
+}
+
+#[unsafe(link_section = ".data.boot")]
+static BOOT_STATUS: AtomicU8 = AtomicU8::new(BootStage::ColdBoot as _);
+
 #[unsafe(link_section = ".text.entry")]
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
@@ -60,9 +73,13 @@ extern "C" fn _start()
 {
     naked_asm!(
         // a0 = physical hartid, a1 = FDT pointer (if hart 0) OR heap_stack_top (if hart > 0)
+        "mv s0, a0",
+        "mv s1, a1",
 
         // Branching: Master vs Secondary
-        "bnez a0, 5f",
+        "la t0, {boot_status}",
+        "lw t1, 0(t0)",
+        "bnez t1, 5f",          // If BOOT_STATUS != 0, jump to secondary setup
 
         // -- Master Hart Setup
         "la t0, {boot_stack}",
@@ -79,7 +96,9 @@ extern "C" fn _start()
         "j 4b",                 // Loop
 
         "6:",
-        "fence iorw, iorw",    // Ensure BSS zeroing is globally visible
+        "fence iorw, iorw",     // Ensure BSS zeroing is globally visible
+        "mv a0, s0",            // Restore for kmain
+        "mv a1, s1",            // Restore for kmain
         // a1 still contains FDT pointer, sp points to BOOT_STACK
         "j 3f",
 
@@ -87,19 +106,21 @@ extern "C" fn _start()
         "5:",
         // a1 contains the `opaque` value (`cpu.stack_top`) from sbi::hart_start
         "mv sp, a1",
+        "mv a0, s0",            // Restore hartid
         "li a1, 0",             // Clear a1 so kmain knows this isn't an FDT
 
         // -- Final Common Setup
         "3:",
         "andi sp, sp, -16",     // Ensure 16-byte alignment for ABI
         "call kmain",
-        "j 2f",                 // If kmain returns (it shouldn't), park the hart safely
+        // If kmain returns (it shouldn't), park the hart safely
 
         // -- Parking Lot
         "2:",
         "wfi",
         "j 2b",
 
+        boot_status = sym BOOT_STATUS,
         boot_stack  = sym BOOT_STACK,
         stack_size  = const STACK_SIZE,
         bss_start   = sym _bss_start,
@@ -107,9 +128,9 @@ extern "C" fn _start()
     );
 }
 
-fn init_cpu_vec(fdt_ptr: *const u8)
+fn init_cpu_vec(fdt_ptr: *const u8, boot_hart_id: usize)
 {
-    let count = fdt::parse_hart_count(fdt_ptr).unwrap();
+    let count = fdt::parse_hart_count(fdt_ptr, boot_hart_id).unwrap();
     let cpus = (0..count)
         .map(|i| {
             let layout = Layout::from_size_align(STACK_SIZE, 4096).unwrap(); // Ensure page alignment
@@ -163,18 +184,22 @@ fn start_harts()
 #[unsafe(no_mangle)]
 extern "C" fn kmain(hart_id: usize, opaque: usize) -> !
 {
-    // If we are Hart 0, `opaque` is the FDT pointer.
+    // If we are the Boot Hart, `opaque` is the FDT pointer.
     // If we are Hart 1+, `opaque` is 0 (unused) (set at `_start`)
 
-    if hart_id == 0
+    if opaque != 0
     {
         let fdt_ptr = opaque as *const u8;
-        println!("[TRACE] Hart 0 kmain entry. FDT pointer: {:p}", fdt_ptr);
+        println!(
+            "[TRACE] Hart {} kmain entry. FDT pointer: {:p}",
+            hart_id, fdt_ptr
+        );
 
         heap::init();
         println!("[TRACE] Heap initialized.");
 
-        init_cpu_vec(fdt_ptr);
+        init_cpu_vec(fdt_ptr, hart_id);
+        BOOT_STATUS.store(BootStage::BssInitialized as _, Ordering::Release);
 
         start_harts();
         // We jump to another function in `start_harts`
@@ -182,6 +207,11 @@ extern "C" fn kmain(hart_id: usize, opaque: usize) -> !
     }
     else
     {
+        while BOOT_STATUS.load(Ordering::Acquire) < BootStage::BssInitialized as _
+        {
+            hint::spin_loop();
+        }
+
         let cpu = CPU_VEC.wait().get(fdt::to_logical(hart_id)).unwrap();
         cpu.set();
 

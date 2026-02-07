@@ -14,6 +14,7 @@ SECTIONS {
     }
 
     .data : ALIGN(4096) {
+        *(.data.boot)
         *(.data*)
     }
 

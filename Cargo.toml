@@ -5,7 +5,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-fdt-rs = { version = "0.4.5", default-features = false }
+fdt = "0.1.5"
 spin = "0.10.0"
 talc = "4.4.3"
 

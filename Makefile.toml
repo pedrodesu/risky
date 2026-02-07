@@ -15,11 +15,17 @@ mapping = { "rv32" = "qemu-system-riscv32", "rv64" = "qemu-system-riscv64" }
 command = "cargo"
 args = ["build", "--target", "${TARGET}"]
 
+[tasks.kill-qemu]
+# This ensures we don't have zombie QEMU instances blocking the UART/GDB
+script = "pkill ${QEMU} || true"
+
 [tasks.run]
-dependencies = ["build"]
+dependencies = ["kill-qemu", "build"]
 command = "${QEMU}"
 args = [
     "-machine", "virt",
+    "-smp", "4", # give em 4 harts
     "-nographic",
+    "-serial", "mon:stdio",
     "-kernel", "target/${TARGET}/debug/risky"
 ]

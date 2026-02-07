@@ -3,7 +3,10 @@
 //! access. The heap is initialized at a fixed location after the kernel's
 //! `.bss` section.
 
-use core::alloc::{GlobalAlloc, Layout};
+use core::{
+    alloc::{GlobalAlloc, Layout},
+    ptr::NonNull,
+};
 
 use spin::Mutex;
 use talc::{ErrOnOom, OomHandler, Span, Talc};
@@ -20,13 +23,13 @@ unsafe impl<O: OomHandler> GlobalAlloc for AllocWrapper<O>
     #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8
     {
-        unsafe { self.0.lock().malloc(layout) }.map_or_default(core::ptr::NonNull::<u8>::as_ptr)
+        unsafe { self.0.lock().malloc(layout) }.map_or_default(NonNull::<u8>::as_ptr)
     }
 
     #[inline]
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout)
     {
-        if let Some(ptr) = core::ptr::NonNull::new(ptr)
+        if let Some(ptr) = NonNull::new(ptr)
         {
             unsafe { self.0.lock().free(ptr, layout) }
         }
