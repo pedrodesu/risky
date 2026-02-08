@@ -123,7 +123,7 @@ impl Task
 
             let task = scheduler.task_mut();
             task.state = TaskState::Dead;
-            println!("Task exited");
+            log::info!("Task exited");
         }
 
         // Trigger a trap to refresh the state immediately

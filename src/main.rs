@@ -14,7 +14,7 @@ extern crate alloc;
 mod csr;
 
 #[macro_use]
-mod uart;
+mod logger;
 
 mod arch;
 mod fdt;
@@ -25,6 +25,7 @@ mod sbi;
 mod soc;
 mod task;
 mod timer;
+mod uart;
 
 use alloc::alloc::alloc;
 use core::{
@@ -167,7 +168,7 @@ fn start_harts()
         // other side.
         if !sbi::hart_start(cpu.physical_id, _start as *const () as usize, cpu.stack_top)
         {
-            println!("[ERROR] Failed to start Hart {}", cpu.physical_id);
+            log::error!("Failed to start Hart {}", cpu.physical_id);
         }
     }
 
@@ -190,13 +191,13 @@ extern "C" fn kmain(hart_id: usize, opaque: usize) -> !
     if opaque != 0
     {
         let fdt_ptr = opaque as *const u8;
-        println!(
-            "[TRACE] Hart {} kmain entry. FDT pointer: {:p}",
-            hart_id, fdt_ptr
-        );
+
+        logger::init();
+
+        log::trace!("Hart {} kmain entry. FDT pointer: {:p}", hart_id, fdt_ptr);
 
         heap::init();
-        println!("[TRACE] Heap initialized.");
+        log::trace!("Heap initialized.");
 
         init_cpu_vec(fdt_ptr, hart_id);
         BOOT_STATUS.store(BootStage::BssInitialized as _, Ordering::Release);
@@ -223,23 +224,21 @@ fn hart_setup() -> !
 {
     let cpu = Cpu::get();
 
-    println!(
-        "[TRACE] Hart {} (Physical {}) is online.",
-        cpu.logical_id, cpu.physical_id
+    log::trace!(
+        "Hart {} (Physical {}) is online.",
+        cpu.logical_id,
+        cpu.physical_id
     );
 
-    println!("[TRACE] Hart {}: Initializing interrupts..", cpu.logical_id);
+    log::trace!("Hart {}: Initializing interrupts..", cpu.logical_id);
     interrupt::init(cpu.trap_stack_top);
 
     plic::init(cpu.physical_id);
 
-    println!(
-        "[TRACE] Hart {}: Scheduling next timer interrupt..",
-        cpu.logical_id
-    );
+    log::trace!("Hart {}: Scheduling next timer interrupt..", cpu.logical_id);
     timer::schedule_next();
 
-    println!("[TRACE] Hart {}: Enabling interrupts..", cpu.logical_id);
+    log::trace!("Hart {}: Enabling interrupts..", cpu.logical_id);
     interrupt::enable();
 
     if cpu.logical_id == 0
@@ -289,9 +288,9 @@ fn task_c()
 #[panic_handler]
 fn panic(info: &PanicInfo) -> !
 {
-    println!("\n--- KERNEL PANIC ---");
-    println!("{}", info);
-    println!("--------------------");
+    log::error!("\n--- KERNEL PANIC ---");
+    log::error!("{}", info);
+    log::error!("--------------------");
 
     loop
     {

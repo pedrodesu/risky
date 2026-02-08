@@ -47,7 +47,7 @@ impl Scheduler
 
     pub fn schedule(&mut self, interrupted_epc: usize) -> usize
     {
-        println!("[TRACE] In scheduler::schedule");
+        // log::trace!("In scheduler::schedule");
 
         // We SHOULD always have at least the main task
         let next_task = match self.waiting_tasks.pop_front()

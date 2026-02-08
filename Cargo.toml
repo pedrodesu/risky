@@ -6,6 +6,8 @@ edition = "2024"
 
 [dependencies]
 fdt = "0.1.5"
+log = "0.4.29"
+owo-colors = { version = "4.2.3", default-features = false }
 spin = "0.10.0"
 talc = "4.4.3"
 
