@@ -1,11 +1,6 @@
-//! This module defines the core task management structures and logic.
+//! Task abstraction, spawning, and lifecycle management.
 //!
-//! It includes:
-//! - `Task`, `TaskKind`, and `TaskState` for representing and managing tasks.
-//! - A `trampoline` function to safely start tasks and ensure they call
-//!   `Task::exit`.
-//! - `Task::spawn` for creating new user-space tasks.
-//! - `Task::exit` for gracefully terminating tasks and triggering a reschedule.
+//! This module defines task types and task lifecycle operations.
 
 mod context;
 mod scheduler;
@@ -16,12 +11,13 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use context::*;
+pub use context::TrapContext;
 pub use scheduler::*;
 
 use crate::{
     arch::{CPU_VEC, Cpu},
-    timer,
+    interrupt,
+    platform::timer,
 };
 
 const STACK_SIZE: usize = 1024 * 16; // 16KB
@@ -39,7 +35,7 @@ pub enum TaskState
 
 pub struct Task
 {
-    pub context: Box<Context>,
+    pub context: Box<TrapContext>,
     pub kind: TaskKind,
     pub state: TaskState,
 }
@@ -56,6 +52,38 @@ pub enum TaskKind
 
 impl Task
 {
+    #[inline]
+    pub fn main() -> Self
+    {
+        Self {
+            context: Box::new(TrapContext::default()),
+            kind: TaskKind::Main,
+            state: TaskState::default(),
+        }
+    }
+
+    /// Spawn a task and distribute it across harts in round-robin order.
+    pub fn spawn(entry: impl FnOnce() + 'static)
+    {
+        let n_harts = CPU_VEC.wait().len();
+        let ticket = SPAWN_TICKET.fetch_add(1, Ordering::Relaxed);
+        let target_hart = ticket % n_harts;
+        let target_cpu = Cpu::nth(target_hart);
+
+        let task = Task::from(Box::new(entry) as Box<dyn FnOnce()>);
+
+        interrupt::with_disabled(|| {
+            let mut scheduler = target_cpu.scheduler.lock();
+            scheduler.add_task(task);
+        });
+
+        let local_cpu = Cpu::get();
+        if target_hart != local_cpu.logical_id
+        {
+            timer::ipi::send(target_cpu.physical_id);
+        }
+    }
+
     #[unsafe(naked)]
     #[unsafe(no_mangle)]
     pub extern "C" fn trampoline()
@@ -79,52 +107,15 @@ impl Task
         closure();
     }
 
-    #[inline]
-    pub fn main() -> Self
-    {
-        Self {
-            context: Box::new(Context::default()),
-            kind: TaskKind::Main,
-            state: TaskState::default(),
-        }
-    }
-
-    pub fn spawn(entry: impl FnOnce() + 'static)
-    {
-        let cpus = CPU_VEC.wait();
-        let n_harts = cpus.len();
-
-        let ticket = SPAWN_TICKET.fetch_add(1, Ordering::Relaxed);
-        let target_hart = ticket % n_harts;
-
-        let boxed: Box<dyn FnOnce()> = Box::new(entry);
-
-        {
-            let mut scheduler = cpus[target_hart].scheduler.lock();
-            scheduler.add_task(Task::from(boxed));
-
-            // Drop the lock before sending the IPI to avoid a race where
-            // the target wakes up and tries to lock the scheduler while we
-            // still hold it.
-        }
-
-        let cpu = Cpu::get();
-        // Wake the target only if it's not us
-        if target_hart != cpu.logical_id
-        {
-            timer::ipi::send(cpus[target_hart].physical_id);
-        }
-    }
-
     fn exit() -> !
     {
-        {
+        interrupt::with_disabled(|| {
             let mut scheduler = Cpu::get().scheduler.lock();
 
             let task = scheduler.task_mut();
             task.state = TaskState::Dead;
-            log::info!("Task exited");
-        }
+        });
+        log::info!("Task exited");
 
         // Trigger a trap to refresh the state immediately
         unsafe { csr_set_i!("sip", 2) } // Raise a supervisor software interrupt
@@ -153,7 +144,7 @@ impl From<Box<dyn FnOnce()>> for Task
         let (data_ptr, vtable_ptr) =
             unsafe { core::mem::transmute::<_, (usize, usize)>(entry_ptr) };
 
-        let ctx = Context {
+        let ctx = TrapContext {
             ra: Task::trampoline as *const () as usize,
             pc: Task::trampoline as *const () as usize,
             sp,

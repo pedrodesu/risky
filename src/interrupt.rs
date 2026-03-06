@@ -1,7 +1,6 @@
-//! This module handles CPU interrupts and exceptions for the RISC-V machine
-//! mode. It sets up the machine trap vector (`mtvec`) to point to an assembly
-//! routine (`_trap`). This routine saves context, calls a high-level Rust
-//! handler (`trap_handler`), and then restores context before returning.
+//! Trap/interrupt initialization and dispatch for supervisor mode.
+//!
+//! This module owns trap setup and high-level interrupt/exception handling.
 
 use core::arch::{asm, global_asm};
 
@@ -10,10 +9,27 @@ use crate::{
         Cpu,
         cause::{self, exceptions, interrupts},
     },
-    timer,
+    platform::timer,
+    task::TrapContext,
 };
 
 pub const SIE_FLAG: usize = 1 << 1; // Supervisor Interrupt Enable for `sstatus`
+
+pub struct LocalIrqGuard
+{
+    was_enabled: bool,
+}
+
+impl Drop for LocalIrqGuard
+{
+    fn drop(&mut self)
+    {
+        if self.was_enabled
+        {
+            enable();
+        }
+    }
+}
 
 #[cfg(target_arch = "riscv64")]
 global_asm!(include_str!("interrupt/rv64.S"));
@@ -21,36 +37,16 @@ global_asm!(include_str!("interrupt/rv64.S"));
 #[cfg(target_arch = "riscv32")]
 global_asm!(include_str!("interrupt/rv32.S"));
 
-/// Defines the layout of the registers saved on the stack during a trap.
-/// This structure is accessed from both Rust and assembly.
+/// Trap frame layout shared with `interrupt/rv*.S`.
 #[repr(C)]
 struct TrapFrame
 {
-    // General-purpose registers
-    ra: usize,
-    t0: usize,
-    t1: usize,
-    t2: usize,
-    a0: usize,
-    a1: usize,
-    a2: usize,
-    a3: usize,
-    a4: usize,
-    a5: usize,
-    a6: usize,
-    a7: usize,
-    t3: usize,
-    t4: usize,
-    t5: usize,
-    t6: usize,
-    // CSRs
-    sepc: usize,
+    context: TrapContext,
     scause: usize,
-    sscratch: usize,
+    _reserved: usize,
 }
 
-// Low-level trap entry point.
-// Referenced by `mtvec` (Machine Trap-Vector Base-Address Register).
+// Low-level trap entry point referenced by `stvec`.
 unsafe extern "C" {
     fn _trap();
 }
@@ -62,48 +58,47 @@ extern "C" fn trap_handler(frame: &mut TrapFrame)
     // Check top bit. If it's 1, we have an interrupt. Otherwise, it's an exception.
     const CAUSE_INTERRUPT_FLAG: usize = 1 << (core::mem::size_of::<usize>() * 8 - 1);
 
-    let &mut TrapFrame { scause, sepc, .. } = frame;
+    let scause = frame.scause;
 
     let is_interrupt = scause & CAUSE_INTERRUPT_FLAG != 0;
     // Mask out the interrupt bit to get the Exception Code
     let code = scause & !CAUSE_INTERRUPT_FLAG;
 
-    let new_epc = if is_interrupt
+    if is_interrupt
     {
         use interrupts::*;
 
         match code
         {
-            SUPERVISOR_SOFTWARE_INTERRUPT => handle_software_interrupt(sepc),
-            SUPERVISOR_TIMER_INTERRUPT => handle_timer_interrupt(sepc),
-            _ => sepc,
+            SUPERVISOR_SOFTWARE_INTERRUPT => handle_software_interrupt(frame),
+            SUPERVISOR_TIMER_INTERRUPT => handle_timer_interrupt(frame),
+            _ =>
+            {}
         }
     }
     else
     {
-        handle_exception(code, sepc)
-    };
-
-    frame.sepc = new_epc;
+        handle_exception(code, frame)
+    }
 }
 
-fn handle_software_interrupt(epc: usize) -> usize
+fn handle_software_interrupt(frame: &mut TrapFrame)
 {
     timer::ipi::clear();
 
     let mut scheduler = Cpu::get().scheduler.lock();
-    scheduler.schedule(epc)
+    scheduler.schedule(&mut frame.context)
 }
 
-fn handle_timer_interrupt(epc: usize) -> usize
+fn handle_timer_interrupt(frame: &mut TrapFrame)
 {
     timer::schedule_next();
 
     let mut scheduler = Cpu::get().scheduler.lock();
-    scheduler.schedule(epc)
+    scheduler.schedule(&mut frame.context)
 }
 
-fn handle_exception(code: usize, epc: usize) -> usize
+fn handle_exception(code: usize, frame: &mut TrapFrame)
 {
     use exceptions::*;
 
@@ -116,44 +111,66 @@ fn handle_exception(code: usize, epc: usize) -> usize
             // We move the EPC forward by 4 so that IF this task is ever
             // rescheduled (not applicable for Dead tasks, but vital for Syscalls),
             // it resumes AFTER the ecall instruction.
-            let next_pc = epc + 4;
+            frame.context.pc += 4;
 
-            // If the task is Dead, schedule() returns the PC of a NEW task.
-            // If the task is alive (e.g. a yield), it returns next_pc.
-            scheduler.schedule(next_pc)
+            scheduler.schedule(&mut frame.context)
         }
         INSTRUCTION_ACCESS_FAULT => panic!(
             "Instruction Access Fault at {:#x}! (Likely task returned or bad RA)",
-            epc
+            frame.context.pc
         ),
-        ILLEGAL_INSTRUCTION => panic!("Illegal Instruction at {:#x}!", epc),
-        LOAD_ACCESS_FAULT => panic!("Load Access Fault at {:#x}!", epc),
-        STORE_ACCESS_FAULT => panic!("Store Access Fault at {:#x}!", epc),
-        _ => panic!("Unhandled exception: code {}, epc {:#x}", code, epc),
+        ILLEGAL_INSTRUCTION => panic!("Illegal Instruction at {:#x}!", frame.context.pc),
+        LOAD_ACCESS_FAULT => panic!("Load Access Fault at {:#x}!", frame.context.pc),
+        STORE_ACCESS_FAULT => panic!("Store Access Fault at {:#x}!", frame.context.pc),
+        _ => panic!(
+            "Unhandled exception: code {}, epc {:#x}",
+            code, frame.context.pc
+        ),
     }
 }
 
-/// Enable all the set interrupts with `init`
+/// Enable local supervisor interrupts on the current hart.
 #[inline]
 pub fn enable()
 {
-    // mstatus.MIE: Global interrupt enable for Machine Mode
     unsafe { csr_set_i!("sstatus", SIE_FLAG) }
 }
 
-/// Disable all interrupts
+/// Returns whether local supervisor interrupts are currently enabled.
+#[inline]
+pub fn is_enabled() -> bool
+{
+    unsafe { csr_read!("sstatus") & SIE_FLAG != 0 }
+}
+
+/// Disable local supervisor interrupts on the current hart.
 #[inline]
 pub fn disable()
 {
-    // mstatus.MIE: Global interrupt enable for Machine Mode
     unsafe { csr_clear_i!("sstatus", SIE_FLAG) }
 }
 
-/// Initialize Machine-Mode Interrupts
+/// Disable local interrupts and restore the previous interrupt state on drop.
+#[inline]
+pub fn disable_guard() -> LocalIrqGuard
+{
+    let was_enabled = is_enabled();
+    disable();
+    LocalIrqGuard { was_enabled }
+}
+
+/// Run `f` with local interrupts disabled, then restore the previous state.
+#[inline]
+pub fn with_disabled<T>(f: impl FnOnce() -> T) -> T
+{
+    let _guard = disable_guard();
+    f()
+}
+
+/// Configure trap vector and enabled interrupt sources for this hart.
 pub fn init(trap_stack_ptr: usize)
 {
-    // stvec setup: Direct mode
-    // All traps will jump to the exact address of _trap
+    // stvec setup: direct mode.
     unsafe {
         asm!(
             "la t0, {trap}",
@@ -162,10 +179,10 @@ pub fn init(trap_stack_ptr: usize)
         )
     }
 
-    // Before enabling interrupts, sscratch must hold the kernel stack pointer
+    // `sscratch` holds the trap stack pointer for the assembly prologue.
     unsafe { csr_write!("sscratch", trap_stack_ptr) }
 
-    // sie: Enable specific interrupt sources
+    // Enable supervisor timer and software interrupts.
     unsafe {
         csr_set!(
             "sie",

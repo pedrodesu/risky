@@ -1,22 +1,14 @@
-//! Implements a simple, cooperative, round-robin scheduler.
+//! Per-hart round-robin scheduler and context-switch policy.
 //!
-//! Key components:
-//! - `SCHEDULER`: A global, lazily-initialized static instance of the
-//!   scheduler.
-//! - `Scheduler`: Manages a queue of `waiting_tasks` and tracks the
-//!   `current_task`.
-//! - `schedule()`: The core scheduling function, called by interrupts to switch
-//!   to the next available task. It handles context switching and task state
-//!   management.
+//! This module manages runnable tasks and scheduling decisions per hart.
 
 use alloc::collections::VecDeque;
 use core::mem;
 
-use super::{Context, Task, TaskKind, TaskState, switch_context};
+use super::{Task, TaskKind, TaskState, TrapContext};
 
 pub struct Scheduler
 {
-    idle_context: Context,
     current_task: Task,
     waiting_tasks: VecDeque<Task>,
 }
@@ -27,7 +19,6 @@ impl Scheduler
     pub fn with_task(task: Task) -> Self
     {
         Self {
-            idle_context: Context::default(),
             current_task: task,
             waiting_tasks: VecDeque::new(),
         }
@@ -45,53 +36,39 @@ impl Scheduler
         self.waiting_tasks.push_back(task);
     }
 
-    pub fn schedule(&mut self, interrupted_epc: usize) -> usize
+    pub fn schedule(&mut self, frame: &mut TrapContext)
     {
-        // log::trace!("In scheduler::schedule");
+        // Persist interrupted task state unless it has already terminated.
+        if self.current_task.state != TaskState::Dead
+        {
+            self.current_task.state = TaskState::Ready;
+            *self.current_task.context = *frame;
+        }
 
-        // We SHOULD always have at least the main task
+        // We should always have at least the main task as a runnable fallback.
         let next_task = match self.waiting_tasks.pop_front()
         {
             Some(task) => task,
-            // No other tasks are ready, so just keep the current one.
+            // No other tasks are ready, keep running the current one.
             None =>
             {
-                // Before returning, we need to unlock the scheduler and
-                // return the interrupted program counter.
-                // This will resume the current task until the next interrupt.
-                return interrupted_epc;
+                if self.current_task.state == TaskState::Dead
+                {
+                    panic!("No runnable tasks available");
+                }
+                self.current_task.state = TaskState::Running;
+                return;
             }
         };
-        let mut old_task = mem::replace(&mut self.current_task, next_task);
 
-        let old_ctx_ptr = if
-        // The task still isn't over
-        old_task.state != TaskState::Dead ||
-            // The main task can never end
-            old_task.kind == TaskKind::Main
+        let old_task = mem::replace(&mut self.current_task, next_task);
+
+        if old_task.state != TaskState::Dead || old_task.kind == TaskKind::Main
         {
-            old_task.context.pc = interrupted_epc;
-
-            let old_ctx = old_task.context.as_mut() as *mut Context;
             self.add_task(old_task);
-            old_ctx
         }
-        else
-        {
-            let old_ctx = &mut self.idle_context;
-            drop(old_task);
-            old_ctx
-        };
 
         self.current_task.state = TaskState::Running;
-        let new_ctx_ptr = self.current_task.context.as_ref() as *const Context;
-        let new_pc = self.current_task.context.pc;
-
-        // After this line, we are on a different stack
-        // We're switching contexts which means switching stacks. This is why we
-        // intentionally drop the mutex before
-        unsafe { switch_context(old_ctx_ptr, new_ctx_ptr) };
-
-        new_pc
+        *frame = *self.current_task.context;
     }
 }

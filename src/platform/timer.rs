@@ -1,12 +1,19 @@
-//! This module handles the machine-mode timer (MTIMER) part of the Core-Local
-//! Interruptor (CLINT). It is used to schedule timer interrupts, which drive
-//! the preemptive multitasking of the scheduler.
+//! Timer and software-interrupt helpers for scheduler preemption.
 
-use crate::sbi;
+use spin::Once;
 
-pub const INTERVAL: u64 = 100_000;
+use crate::platform::sbi;
 
-/// Reads the 64-bit TIME register
+static INTERVAL: Once<u64> = Once::new();
+
+const SIP_SSIP: usize = 1 << 1;
+
+pub fn init(timebase_hz: Option<u64>)
+{
+    let tick_hz = 100; // 10ms
+    INTERVAL.call_once(|| timebase_hz.unwrap_or(10_000_000) / tick_hz);
+}
+
 #[cfg(target_arch = "riscv64")]
 #[inline]
 fn read_time() -> u64
@@ -14,9 +21,6 @@ fn read_time() -> u64
     unsafe { csr_read!("time") as u64 }
 }
 
-/// Reads the 64-bit TIME register on a 32-bit architecture.
-/// This requires a special sequence to handle potential rollovers of the
-/// lower 32 bits during the read.
 #[cfg(target_arch = "riscv32")]
 fn read_time() -> u64
 {
@@ -44,16 +48,13 @@ pub mod ipi
     #[inline]
     pub fn clear()
     {
-        unsafe { csr_clear_i!("sip", 2) }
+        unsafe { csr_clear_i!("sip", SIP_SSIP) }
     }
 }
 
 #[inline]
 pub fn schedule_next()
 {
-    // Read the current real-time counter
     let now = read_time();
-
-    // Schedule the first interval
-    sbi::set_timer(now + INTERVAL);
+    sbi::set_timer(now + INTERVAL.wait());
 }

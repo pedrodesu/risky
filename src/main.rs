@@ -1,76 +1,30 @@
-//! This is the main entry point for the kernel.
-//! It sets up the boot stack for the primary hart (core), parks other harts,
-//! and then jumps to `kmain`. The `kmain` function is responsible for
-//! initializing all kernel subsystems, starting the scheduler, and spawning
-//! initial tasks.
+//! Kernel entrypoint and multi-hart boot orchestration.
+//!
+//! This file contains the boot path and runtime initialization flow for all
+//! harts.
 
 #![no_std]
 #![no_main]
-#![feature(result_option_map_or_default)]
 
-extern crate alloc;
-
-#[macro_use]
-mod csr;
-
-#[macro_use]
-mod logger;
-
-mod arch;
-mod fdt;
-mod heap;
-mod interrupt;
-mod plic;
-mod sbi;
-mod soc;
-mod task;
-mod timer;
-mod uart;
-
-use alloc::alloc::alloc;
 use core::{
-    alloc::Layout,
     arch::{asm, naked_asm},
-    hint,
     panic::PanicInfo,
-    sync::atomic::{AtomicU8, Ordering},
 };
 
-use spin::Mutex;
-use task::{Scheduler, Task};
-
-use crate::arch::{CPU_VEC, Cpu};
-
-// Ensure the page alignment of the stacks
-#[repr(align(4096))]
-pub struct Aligned<const N: usize>([u8; N]);
-
-const STACK_SIZE: usize = 1024 * 32; // 32KB
-const TRAP_STACK_SIZE: usize = 1024 * 8; // 8KB
+use risky::{BOOT_STATUS, STACK_SIZE, arch::PageAligned, drivers::uart};
 
 #[unsafe(link_section = ".bss.stack")]
-static mut BOOT_STACK: Aligned<STACK_SIZE> = Aligned([0; _]);
+static mut BOOT_STACK: PageAligned<STACK_SIZE> = PageAligned([0; _]);
 
 unsafe extern "C" {
     static _bss_start: u8;
     static _bss_end: u8;
 }
 
-#[repr(u8)]
-enum BootStage
-{
-    ColdBoot = 0,
-    BssInitialized = 1,
-    ReadyToWork = 2,
-}
-
-#[unsafe(link_section = ".data.boot")]
-static BOOT_STATUS: AtomicU8 = AtomicU8::new(BootStage::ColdBoot as _);
-
 #[unsafe(link_section = ".text.entry")]
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
-extern "C" fn _start()
+pub extern "C" fn _start()
 {
     naked_asm!(
         // a0 = physical hartid, a1 = FDT pointer (if hart 0) OR heap_stack_top (if hart > 0)
@@ -129,165 +83,11 @@ extern "C" fn _start()
     );
 }
 
-fn init_cpu_vec(fdt_ptr: *const u8, boot_hart_id: usize)
-{
-    let count = fdt::parse_hart_count(fdt_ptr, boot_hart_id).unwrap();
-    let cpus = (0..count)
-        .map(|i| {
-            let layout = Layout::from_size_align(STACK_SIZE, 4096).unwrap(); // Ensure page alignment
-            let stack_ptr = unsafe { alloc(layout) as usize };
-
-            let t_layout = Layout::from_size_align(TRAP_STACK_SIZE, 4096).unwrap();
-            let trap_ptr = unsafe { alloc(t_layout) as usize };
-
-            Cpu {
-                physical_id: fdt::to_physical(i),
-                logical_id: i,
-                scheduler: Mutex::new(Scheduler::with_task(Task::main())),
-                stack_top: stack_ptr + STACK_SIZE,
-                trap_stack_top: trap_ptr + STACK_SIZE,
-            }
-        })
-        .collect();
-
-    CPU_VEC.call_once(|| cpus);
-}
-
-fn start_harts()
-{
-    let cpus = &CPU_VEC.wait();
-    // Safety: We know we have at least one CPU (CPU zero)
-    let (cpu_zero, rem_cpus) = unsafe { cpus.split_first().unwrap_unchecked() };
-
-    cpu_zero.set();
-
-    // Hart 0 is already started.
-    for cpu in rem_cpus
-    {
-        // We pass `stack_to_use` as the `opaque` value. This arrives in `a1` on the
-        // other side.
-        if !sbi::hart_start(cpu.physical_id, _start as *const () as usize, cpu.stack_top)
-        {
-            log::error!("Failed to start Hart {}", cpu.physical_id);
-        }
-    }
-
-    unsafe {
-        asm!(
-            "mv sp, {0}",
-            "jr {1}",
-            in(reg) cpu_zero.stack_top,
-            in(reg) hart_setup as *const () as usize,
-        )
-    }
-}
-
-#[unsafe(no_mangle)]
-extern "C" fn kmain(hart_id: usize, opaque: usize) -> !
-{
-    // If we are the Boot Hart, `opaque` is the FDT pointer.
-    // If we are Hart 1+, `opaque` is 0 (unused) (set at `_start`)
-
-    if opaque != 0
-    {
-        let fdt_ptr = opaque as *const u8;
-
-        logger::init();
-
-        log::trace!("Hart {} kmain entry. FDT pointer: {:p}", hart_id, fdt_ptr);
-
-        heap::init();
-        log::trace!("Heap initialized.");
-
-        init_cpu_vec(fdt_ptr, hart_id);
-        BOOT_STATUS.store(BootStage::BssInitialized as _, Ordering::Release);
-
-        start_harts();
-        // We jump to another function in `start_harts`
-        unreachable!();
-    }
-    else
-    {
-        while BOOT_STATUS.load(Ordering::Acquire) < BootStage::BssInitialized as _
-        {
-            hint::spin_loop();
-        }
-
-        let cpu = CPU_VEC.wait().get(fdt::to_logical(hart_id)).unwrap();
-        cpu.set();
-
-        hart_setup();
-    }
-}
-
-fn hart_setup() -> !
-{
-    let cpu = Cpu::get();
-
-    log::trace!(
-        "Hart {} (Physical {}) is online.",
-        cpu.logical_id,
-        cpu.physical_id
-    );
-
-    log::trace!("Hart {}: Initializing interrupts..", cpu.logical_id);
-    interrupt::init(cpu.trap_stack_top);
-
-    plic::init(cpu.physical_id);
-
-    log::trace!("Hart {}: Scheduling next timer interrupt..", cpu.logical_id);
-    timer::schedule_next();
-
-    log::trace!("Hart {}: Enabling interrupts..", cpu.logical_id);
-    interrupt::enable();
-
-    if cpu.logical_id == 0
-    {
-        Task::spawn(task_a);
-        Task::spawn(task_b);
-        Task::spawn(task_c);
-    }
-
-    loop
-    {
-        sbi::hart_suspend();
-    }
-}
-
-fn task_a()
-{
-    loop
-    {
-        print!("A");
-
-        for _ in 0..1000000
-        {
-            unsafe { asm!("nop") }
-        }
-    }
-}
-
-fn task_b()
-{
-    loop
-    {
-        print!("B");
-
-        for _ in 0..1000000
-        {
-            unsafe { asm!("nop") }
-        }
-    }
-}
-
-fn task_c()
-{
-    println!("C");
-}
-
 #[panic_handler]
 fn panic(info: &PanicInfo) -> !
 {
+    uart::set_direct_mode(true);
+
     log::error!("\n--- KERNEL PANIC ---");
     log::error!("{}", info);
     log::error!("--------------------");

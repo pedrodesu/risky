@@ -1,15 +1,8 @@
+//! Global kernel logger implementation.
+//!
+//! This module configures the kernel logging backend and formatting.
+
 use owo_colors::OwoColorize;
-
-#[macro_export]
-macro_rules! print {
-    ($($arg:tt)*) => ($crate::uart::_print(format_args!($($arg)*)));
-}
-
-#[macro_export]
-macro_rules! println {
-    () => ($crate::print!("\n"));
-    ($($arg:tt)*) => ($crate::print!("{}\n", format_args!($($arg)*)));
-}
 
 struct Logger;
 
@@ -18,7 +11,6 @@ impl log::Log for Logger
     #[inline]
     fn enabled(&self, _: &log::Metadata) -> bool
     {
-        // metadata.level() <= Level::Info
         true
     }
 

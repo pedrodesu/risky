@@ -1,18 +1,27 @@
-use core::arch::global_asm;
+//! Saved register context for trap-driven task scheduling.
 
-// We `derive(Default)` because we want to use a mock Context for the
-// `idle_context`. It will then be populated with values via `ld` instructions
-// on `switch_context`
-// This struct and the fields order are tightly coupled with the .S assembly!
+/// Full register snapshot used by trap-driven preemptive scheduling.
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Context
+pub struct TrapContext
 {
-    // Return address
     pub ra: usize,
-    // Stack pointer - This is why we align(16) the struct. RISC-V requires it.
     pub sp: usize,
-    // Frame pointers
+    pub t0: usize,
+    pub t1: usize,
+    pub t2: usize,
+    pub t3: usize,
+    pub t4: usize,
+    pub t5: usize,
+    pub t6: usize,
+    pub a0: usize,
+    pub a1: usize,
+    pub a2: usize,
+    pub a3: usize,
+    pub a4: usize,
+    pub a5: usize,
+    pub a6: usize,
+    pub a7: usize,
     pub s0: usize,
     pub s1: usize,
     pub s2: usize,
@@ -25,16 +34,5 @@ pub struct Context
     pub s9: usize,
     pub s10: usize,
     pub s11: usize,
-    // The hardware ret. Get out of the trap and into the task
     pub pc: usize,
-}
-
-#[cfg(target_arch = "riscv64")]
-global_asm!(include_str!("context/rv64.S"));
-
-#[cfg(target_arch = "riscv32")]
-global_asm!(include_str!("context/rv32.S"));
-
-unsafe extern "C" {
-    pub fn switch_context(old_ptr: *mut Context, new_ptr: *const Context);
 }

@@ -1,3 +1,8 @@
+//! Convenience macros for RISC-V CSR access.
+//!
+//! This module provides reusable macros for common control/status register
+//! operations.
+
 /// Atomically clear bits in a CSR (no register). More efficient for smaller
 /// operands.
 #[macro_export]
